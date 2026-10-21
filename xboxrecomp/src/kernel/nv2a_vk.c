@@ -61,6 +61,13 @@ int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
 int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
                          uint32_t nv, const uint32_t *idx, uint32_t nidx)
 { (void)s; (void)hash; (void)vin; (void)nv; (void)idx; (void)nidx; return 0; }
+int nv2a_vk_raw_verts(void) { return 0; }
+int nv2a_vk_strips(void) { return 0; }
+int nv2a_vk_vfmt_ok(int fmt) { (void)fmt; return 0; }
+int nv2a_vk_program_cmp(uint32_t hash, uint16_t cmp) { (void)hash; (void)cmp; return 0; }
+int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVerts *vx,
+                             uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{ (void)s; (void)hash; (void)vx; (void)nv; (void)idx; (void)nidx; return 0; }
 
 #else
 
@@ -95,7 +102,8 @@ int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
     X(vkCmdSetCullMode, "EXT") X(vkCmdSetFrontFace, "EXT") \
     X(vkCmdSetDepthTestEnable, "EXT") X(vkCmdSetDepthWriteEnable, "EXT") \
     X(vkCmdSetDepthCompareOp, "EXT") X(vkCmdSetStencilTestEnable, "EXT") \
-    X(vkCmdSetStencilOp, "EXT") X(vkResetQueryPool, "EXT")
+    X(vkCmdSetStencilOp, "EXT") X(vkResetQueryPool, "EXT") \
+    X(vkCmdSetPrimitiveTopology, "EXT")
 #define VK_LATE_DECL(name, sfx) static PFN_##name p_##name;
 VK_LATE_FNS(VK_LATE_DECL)
 #undef VK_LATE_DECL
@@ -109,6 +117,7 @@ VK_LATE_FNS(VK_LATE_DECL)
 #define vkCmdSetStencilTestEnable p_vkCmdSetStencilTestEnable
 #define vkCmdSetStencilOp         p_vkCmdSetStencilOp
 #define vkResetQueryPool          p_vkResetQueryPool
+#define vkCmdSetPrimitiveTopology p_vkCmdSetPrimitiveTopology
 
 /* 0 if any is missing. */
 static int vk_load_device_fns(VkDevice dev)
@@ -263,14 +272,24 @@ typedef struct {
     int failed;
 } Pipe;
 
-/* A title vertex program, compiled to a Vulkan vertex shader. */
+/* A title vertex program, compiled to a Vulkan vertex shader. `cmp`: the
+ * v-registers it reads as packed normals (NV2A_VF_CMP) and decodes itself;
+ * such a variant is a program of its own, `hash` (its id: the pipelines',
+ * the disk cache's) prog_id(base, cmp). */
 typedef struct {
     uint32_t hash;
     volatile int state;         /* 0 empty, 1 compiled, 2 compiling (worker), -1 failed */
     VkShaderModule vs;
     uint32_t ninputs;
     uint8_t inputs[16];
+    uint32_t base;
+    uint16_t cmp;
 } Prog;
+
+static uint32_t prog_id(uint32_t base, uint16_t cmp)
+{
+    return cmp ? base ^ (((uint32_t)cmp * 0x85EBCA77u) | 1u) : base;
+}
 
 typedef struct {
     uint64_t key;
@@ -469,6 +488,42 @@ static struct {
     WlcDesc wl_desc;            /* mode 3: what the window was told */
     float hdr_paper, hdr_peak, hdr_strength, hdr_glow, hdr_knee;
     int has_colorspace_ext, has_hdr_meta;
+    /* VK_EXT_vertex_input_dynamic_state (RECOMP_VK_RAW_VERTS=0 leaves it
+     * off): every pipeline built by pipe_build takes its vertex layout at
+     * the draw, so a program draw can hand the title's vertices over as
+     * they are (nv2a_vk_draw_program_raw). `vf_ok` the formats the device
+     * reads; `vi_key` the layout last set, `vi_valid` 0 after anything
+     * that may have replaced it. */
+    int vi_dyn, vi_valid;
+    /* The primitive topology last set (dynamic in every pipe_build
+     * pipeline, so a strip shares a list's pipelines), -1 when unknown. */
+    int topo_set;
+    /* The dynamic state draw_common last set (dyn_valid 0: unknown), and
+     * whether the index ring is bound at offset 0 (draws then start at
+     * firstIndex): most draws change little of it, and each call costs
+     * the driver. */
+    struct {
+        VkViewport vp;
+        VkRect2D sc;
+        float bc[4];
+        uint32_t cull, ff, dt, dw, dco, ste, sop[4], scm, swm, sref;
+    } dyn;
+    int dyn_valid, idx_bound;
+    /* Descriptor sets made this pool's lifetime, by their images and
+     * samplers: draws alternate between a few, and making one (allocate,
+     * write) for every change was 4% of the executor. `dsc_gen` moves on
+     * whenever the pool is reset or swapped, emptying it; the views a set
+     * holds are destroyed only then (retire). RECOMP_VK_DSET_CACHE=0: off. */
+    struct {
+        VkImageView views[8];
+        VkSampler samps[8];
+        VkDescriptorSet set;
+        uint32_t gen;
+    } dsc[256];
+    uint32_t dsc_gen;
+    PFN_vkCmdSetVertexInputEXT set_vi;
+    uint8_t vf_ok[NV2A_VF_COUNT];
+    uint32_t vi_key[2 + 3 + 16 * 3];
     VkImageView sc_view[8];
     int sc_attach;              /* the images can be drawn into (touch controls) */
     VkPipeline touch_pipe;      /* the on-screen touch controls, for touch_fmt */
@@ -532,6 +587,122 @@ static struct {
     uint32_t st_pipes_async;    /* general pipelines handed to the worker */
     double st_compile_ms, st_pipe_ms;
 } V;
+
+/* NV2A_VF_* as Vulkan formats. */
+static VkFormat vfmt_vk(int f)
+{
+    static const VkFormat t[NV2A_VF_COUNT] = {
+        VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT,
+        VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT,
+        VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM,
+        VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_R16_SNORM, VK_FORMAT_R16G16_SNORM,
+        VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16A16_SNORM,
+        VK_FORMAT_R16_SSCALED, VK_FORMAT_R16G16_SSCALED,
+        VK_FORMAT_R16G16B16_SSCALED, VK_FORMAT_R16G16B16A16_SSCALED,
+        /* The packed normal as two halves: a vertex's 32 bits need only
+         * be 2-byte aligned that way, and the title's strides are not
+         * multiples of 4. */
+        VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R16G16_UINT,
+    };
+    return f >= 0 && f < NV2A_VF_COUNT ? t[f] : VK_FORMAT_UNDEFINED;
+}
+
+/* A draw's vertex buffers and layout: up to three bindings (the title's
+ * bytes, the inputs converted on the CPU, the (0, 0, 0, 1) of an absent
+ * input) and per input its binding, format and offset. Without dynamic
+ * vertex input, only the float layout pipe_build bakes in is used. */
+typedef struct {
+    uint32_t n, nb;
+    uint32_t stride[3];
+    uint8_t bind[16];
+    VkFormat fmt[16];
+    uint32_t off[16];
+    VkDeviceSize boff[3];
+} VtxBind;
+
+static void vtx_float(VtxBind *b, uint32_t ninputs, VkDeviceSize voff)
+{
+    uint32_t i;
+    b->n = ninputs;
+    b->nb = 1;
+    b->stride[0] = 16 * ninputs;
+    b->boff[0] = voff;
+    for (i = 0; i < ninputs; i++) {
+        b->bind[i] = 0;
+        b->fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+        b->off[i] = 16 * i;
+    }
+}
+
+/* Bind `b`'s buffers and, with dynamic vertex input, set its layout --
+ * unless it is the one already set. */
+static void vtx_bind(const VtxBind *b)
+{
+    VkBuffer bufs[3];
+    uint32_t key[2 + 3 + 16 * 3], i, k = 0;
+    bufs[0] = bufs[1] = bufs[2] = V.vtx.buf;
+    vkCmdBindVertexBuffers(V.dcb, 0, b->nb, bufs, b->boff);
+    if (!V.vi_dyn)
+        return;
+    memset(key, 0, sizeof key);
+    key[k++] = b->n;
+    key[k++] = b->nb;
+    for (i = 0; i < 3; i++)
+        key[k++] = i < b->nb ? b->stride[i] : 0;
+    for (i = 0; i < b->n; i++) {
+        key[k++] = b->bind[i];
+        key[k++] = (uint32_t)b->fmt[i];
+        key[k++] = b->off[i];
+    }
+    if (V.vi_valid && !memcmp(key, V.vi_key, sizeof key))
+        return;
+    {
+        VkVertexInputBindingDescription2EXT bd[3];
+        VkVertexInputAttributeDescription2EXT ad[16];
+        for (i = 0; i < b->nb; i++) {
+            memset(&bd[i], 0, sizeof bd[i]);
+            bd[i].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT;
+            bd[i].binding = i;
+            bd[i].stride = b->stride[i];
+            bd[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            bd[i].divisor = 1;
+        }
+        for (i = 0; i < b->n; i++) {
+            memset(&ad[i], 0, sizeof ad[i]);
+            ad[i].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT;
+            ad[i].location = i;
+            ad[i].binding = b->bind[i];
+            ad[i].format = b->fmt[i];
+            ad[i].offset = b->off[i];
+        }
+        V.set_vi(V.dcb, b->nb, bd, b->n, ad);
+    }
+    memcpy(V.vi_key, key, sizeof key);
+    V.vi_valid = 1;
+}
+
+/* After anything that sets dynamic state behind draw_common's back. */
+static void dyn_forget(void)
+{
+    V.vi_valid = 0;
+    V.topo_set = -1;
+    V.dyn_valid = 0;
+    V.idx_bound = 0;
+}
+
+/* The draw's topology (Nv2aVkState.topology), unless it is already set. */
+static void topo_set(uint32_t t)
+{
+    static const VkPrimitiveTopology k[4] = {
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+    };
+    if ((int)(t & 3) == V.topo_set)
+        return;
+    vkCmdSetPrimitiveTopology(V.dcb, k[t & 3]);
+    V.topo_set = (int)(t & 3);
+}
 
 static double now_ms(void)
 {
@@ -877,6 +1048,7 @@ static void segment_begin(void)
     vkBeginCommandBuffer(V.ucb, &bi);
     vkBeginCommandBuffer(V.dcb, &bi);
     V.bound_pipe = VK_NULL_HANDLE;
+    dyn_forget();
     V.recording = 1;
     V.seg_draws = 0;
     if (V.tspool && V.nts + 2 <= 2 * (VK_KICKS + 2))
@@ -914,7 +1086,7 @@ static void end_rendering(void)
     V.cur_samples = 1;
 }
 
-static uint64_t hash_bytes(const uint8_t *p, size_t n)
+static uint64_t hash_scalar(const uint8_t *p, size_t n)
 {
     /* Four independent lanes, so the multiplies overlap. Not a quality hash;
      * a change detector over memory the title rewrites wholesale. */
@@ -933,6 +1105,112 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n)
     for (; i < n; i++)
         h0 = (h0 ^ p[i]) * 0x100000001B3ull;
     return h0 ^ (h1 * 31) ^ (h2 * 1009) ^ (h3 * 65599) ^ n;
+}
+
+#if defined(__x86_64__)
+/* The same job in SIMD lanes, XXH3's way: each 64-bit lane adds its data
+ * and (data ^ key) low half times high half. The scalar loop waits on its
+ * multiplies (~28 GB/s on a Zen 5); these do not (~45 with SSE2, ~88 with
+ * AVX2). The keys move on with each block, so blocks that trade places
+ * change the result too. Textures and surfaces hashed every epoch were a
+ * fifth of the executor in the paused race. */
+#include <immintrin.h>
+
+static uint64_t hash_fold(const uint64_t *lane, int nl, uint64_t tail, size_t n)
+{
+    uint64_t h = 0x27D4EB2F165667C5ull ^ n;
+    int i;
+    for (i = 0; i < nl; i++) {
+        h = (h ^ lane[i]) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 32;
+    }
+    return (h ^ tail) * 0xC2B2AE3D27D4EB4Full;
+}
+
+#define HASH_LANES(PRE, T, a, d, k) do { \
+        T x_ = PRE##_xor_si##T##_(d, k); \
+        a = PRE##_add_epi64(a, PRE##_add_epi64(PRE##_mul_epu32(x_, PRE##_srli_epi64(x_, 32)), \
+                                               PRE##_shuffle_epi32(d, _MM_SHUFFLE(1, 0, 3, 2)))); \
+    } while (0)
+#define _mm_xor_si__m128i_ _mm_xor_si128
+#define _mm256_xor_si__m256i_ _mm256_xor_si256
+
+static uint64_t hash_sse2(const uint8_t *p, size_t n)
+{
+    const __m128i k0 = _mm_set_epi64x(0x1F67B3B7A4A44072ll, 0x78E5C0CC4EE679CBll);
+    const __m128i k1 = _mm_set_epi64x(0x4C263A81E69035E0ll, (long long)0xCB00C391BB52283Cull);
+    const __m128i k2 = _mm_set_epi64x((long long)0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ll);
+    const __m128i k3 = _mm_set_epi64x(0x647378D9C97E9FC8ll, (long long)0xC3EBD33483ACC5EAull);
+    const __m128i step = _mm_set1_epi64x(0x0000000100000001ll);
+    __m128i a0 = k0, a1 = k1, a2 = k2, a3 = k3, ctr = _mm_setzero_si128();
+    uint64_t lane[8];
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        __m128i d0 = _mm_loadu_si128((const __m128i *)(p + i));
+        __m128i d1 = _mm_loadu_si128((const __m128i *)(p + i + 16));
+        __m128i d2 = _mm_loadu_si128((const __m128i *)(p + i + 32));
+        __m128i d3 = _mm_loadu_si128((const __m128i *)(p + i + 48));
+        HASH_LANES(_mm, __m128i, a0, d0, _mm_add_epi64(k0, ctr));
+        HASH_LANES(_mm, __m128i, a1, d1, _mm_add_epi64(k1, ctr));
+        HASH_LANES(_mm, __m128i, a2, d2, _mm_add_epi64(k2, ctr));
+        HASH_LANES(_mm, __m128i, a3, d3, _mm_add_epi64(k3, ctr));
+        ctr = _mm_add_epi64(ctr, step);
+    }
+    _mm_storeu_si128((__m128i *)lane, a0);
+    _mm_storeu_si128((__m128i *)(lane + 2), a1);
+    _mm_storeu_si128((__m128i *)(lane + 4), a2);
+    _mm_storeu_si128((__m128i *)(lane + 6), a3);
+    return hash_fold(lane, 8, hash_scalar(p + i, n - i), n);
+}
+
+__attribute__((target("avx2")))
+static uint64_t hash_avx2(const uint8_t *p, size_t n)
+{
+    const __m256i k0 = _mm256_set_epi64x(0x1CAD21F72C81017Cll, (long long)0xDB979083E96DD4DEull,
+                                         0x1F67B3B7A4A44072ll, 0x78E5C0CC4EE679CBll);
+    const __m256i k1 = _mm256_set_epi64x(0x2172FFCC7DD05A82ll, (long long)0x8E2443F7744608B8ull,
+                                         0x4C263A81E69035E0ll, (long long)0xCB00C391BB52283Cull);
+    const __m256i k2 = _mm256_set_epi64x((long long)0xA32E531B8B65D088ull, 0x4EF90DA297486471ll,
+                                         (long long)0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ll);
+    const __m256i k3 = _mm256_set_epi64x(0x1D4F0BC7C7BBDCF9ll, 0x3159B4CD4BE0518All,
+                                         0x647378D9C97E9FC8ll, (long long)0xC3EBD33483ACC5EAull);
+    const __m256i step = _mm256_set1_epi64x(0x0000000100000001ll);
+    __m256i a0 = k0, a1 = k1, a2 = k2, a3 = k3, ctr = _mm256_setzero_si256();
+    uint64_t lane[16];
+    size_t i = 0;
+    for (; i + 128 <= n; i += 128) {
+        __m256i d0 = _mm256_loadu_si256((const __m256i *)(p + i));
+        __m256i d1 = _mm256_loadu_si256((const __m256i *)(p + i + 32));
+        __m256i d2 = _mm256_loadu_si256((const __m256i *)(p + i + 64));
+        __m256i d3 = _mm256_loadu_si256((const __m256i *)(p + i + 96));
+        HASH_LANES(_mm256, __m256i, a0, d0, _mm256_add_epi64(k0, ctr));
+        HASH_LANES(_mm256, __m256i, a1, d1, _mm256_add_epi64(k1, ctr));
+        HASH_LANES(_mm256, __m256i, a2, d2, _mm256_add_epi64(k2, ctr));
+        HASH_LANES(_mm256, __m256i, a3, d3, _mm256_add_epi64(k3, ctr));
+        ctr = _mm256_add_epi64(ctr, step);
+    }
+    _mm256_storeu_si256((__m256i *)lane, a0);
+    _mm256_storeu_si256((__m256i *)(lane + 4), a1);
+    _mm256_storeu_si256((__m256i *)(lane + 8), a2);
+    _mm256_storeu_si256((__m256i *)(lane + 12), a3);
+    return hash_fold(lane, 16, hash_scalar(p + i, n - i), n);
+}
+#undef HASH_LANES
+#endif
+
+/* RECOMP_VK_HASH_SIMD=0: the scalar loop for everything. */
+static uint64_t hash_bytes(const uint8_t *p, size_t n)
+{
+#if defined(__x86_64__)
+    static int simd = -1;
+    if (simd < 0) {
+        const char *e = getenv("RECOMP_VK_HASH_SIMD");
+        simd = e && strcmp(e, "0") == 0 ? 0 : __builtin_cpu_supports("avx2") ? 2 : 1;
+    }
+    if (n >= 256 && simd)
+        return simd == 2 ? hash_avx2(p, n) : hash_sse2(p, n);
+#endif
+    return hash_scalar(p, n);
 }
 
 /* 64 bytes of every kilobyte, and the last 64: a texture streamed into
@@ -1713,6 +1991,7 @@ static void slot_use(int i)
     memcpy(V.kfence, sl->kfence, sizeof V.kfence);
     V.fence = sl->fence;
     V.dpool = sl->dpool;
+    V.dsc_gen++;
     V.tspool = sl->tspool;
     V.qpool = sl->qpool;
     V.sem_acq = sl->sem_acq;
@@ -1761,6 +2040,8 @@ static void pend_retire(Pend *p)
             V.rep_acc += delta;
     }
     vkResetDescriptorPool(V.dev, sl->dpool, 0);
+    if (sl->dpool == V.dpool)
+        V.dsc_gen++;
     destroy_list(p->retired, p->nretired);
     p->nretired = 0;
 }
@@ -1886,6 +2167,7 @@ static void vk_sync_inner(int readback)
     V.vtx.used = V.idx.used = V.ubo.used = V.stage.used = V.rb.used = 0;
     vkResetDescriptorPool(V.dev, V.dpool, 0);
     V.sets_used = 0;
+    V.dsc_gen++;
     V.last_set = VK_NULL_HANDLE;
     destroy_retired();
     V.epoch++;
@@ -1934,6 +2216,7 @@ static void vk_flip(void)
     pend_retire(&V.pend[nxt]);
     slot_use(nxt);
     V.sets_used = 0;
+    V.dsc_gen++;
     V.last_set = VK_NULL_HANDLE;
     V.epoch++;
 }
@@ -2525,8 +2808,8 @@ static int vk_init(void)
         }
         dci.pNext = &f2;
         {
-            static const char *swext[4];
-            int has_pid = 0, has_pw = 0, nx = 0;
+            static const char *swext[6];
+            int has_pid = 0, has_pw = 0, has_vi = 0, nx = 0;
             const char *ft = getenv("RECOMP_FRAME_TIMES");
             VkExtensionProperties ep[512];
             uint32_t ne = 512, k;
@@ -2540,6 +2823,24 @@ static int vk_init(void)
                     has_pid = 1;
                 if (!strcmp(ep[k].extensionName, "VK_KHR_present_wait"))
                     has_pw = 1;
+                if (!strcmp(ep[k].extensionName, "VK_EXT_vertex_input_dynamic_state"))
+                    has_vi = 1;
+            }
+            {
+                static VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT fvi = {
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT };
+                VkPhysicalDeviceFeatures2 q2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+                const char *e = getenv("RECOMP_VK_RAW_VERTS");
+                if (has_vi && !(e && strcmp(e, "0") == 0)) {
+                    q2.pNext = &fvi;
+                    vkGetPhysicalDeviceFeatures2(V.pd, &q2);
+                    if (fvi.vertexInputDynamicState) {
+                        fvi.pNext = f2.pNext;
+                        f2.pNext = &fvi;
+                        swext[nx++] = "VK_EXT_vertex_input_dynamic_state";
+                        V.vi_dyn = 1;
+                    }
+                }
             }
             if (V.has_swapchain_ext) {
                 swext[nx++] = "VK_KHR_swapchain";
@@ -2554,11 +2855,11 @@ static int vk_init(void)
                     f12.pNext = &fpid;
                     V.has_pwait = 1;
                 }
-                dci.enabledExtensionCount = (uint32_t)nx;
-                dci.ppEnabledExtensionNames = swext;
             } else {
                 V.has_hdr_meta = 0;
             }
+            dci.enabledExtensionCount = (uint32_t)nx;
+            dci.ppEnabledExtensionNames = nx ? swext : NULL;
         }
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
@@ -2574,6 +2875,24 @@ static int vk_init(void)
             return vk_fail("vkGetDeviceProcAddr", VK_ERROR_INITIALIZATION_FAILED);
 #endif
         vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
+        if (V.vi_dyn) {
+            V.set_vi = (PFN_vkCmdSetVertexInputEXT)vkGetDeviceProcAddr(V.dev, "vkCmdSetVertexInputEXT");
+            if (!V.set_vi)
+                V.vi_dyn = 0;
+        }
+        if (V.vi_dyn) {
+            /* Formats the title's vertices come in. The three-component
+             * 8- and 16-bit ones are optional in Vulkan. */
+            int f, n = 0;
+            for (f = 0; f < NV2A_VF_COUNT; f++) {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(V.pd, vfmt_vk(f), &fp);
+                V.vf_ok[f] = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+                n += V.vf_ok[f];
+            }
+            fprintf(stderr, "  [VK] title vertices read as they are (%d of %d formats)\n",
+                    n, NV2A_VF_COUNT);
+        }
     }
     {
         VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -2926,7 +3245,8 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
         VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-        VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+        VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
     };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
@@ -2980,7 +3300,8 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
     ba.colorWriteMask = d->cm;
     bs.attachmentCount = d->cfmt != VK_FORMAT_UNDEFINED ? 1 : 0;
     bs.pAttachments = &ba;
-    dy.dynamicStateCount = sizeof dyn / sizeof dyn[0];
+    /* The last, the vertex layout, only with dynamic vertex input. */
+    dy.dynamicStateCount = sizeof dyn / sizeof dyn[0] - (V.vi_dyn ? 0 : 1);
     dy.pDynamicStates = dyn;
     ri.colorAttachmentCount = d->cfmt != VK_FORMAT_UNDEFINED ? 1 : 0;
     ri.pColorAttachmentFormats = &d->cfmt;
@@ -2989,7 +3310,7 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
     gp.pNext = &ri;
     gp.stageCount = 2;
     gp.pStages = st;
-    gp.pVertexInputState = &vi;
+    gp.pVertexInputState = V.vi_dyn ? NULL : &vi;
     gp.pInputAssemblyState = &ia;
     gp.pViewportState = &vps;
     gp.pRasterizationState = &rs;
@@ -3055,7 +3376,7 @@ static void pipe_desc(PipeDesc *d, VkFormat cfmt, int has_depth, const Nv2aVkSta
     d->beq = s->blend_equation;
     d->sf = s->blend_sfactor;
     d->df = s->blend_dfactor;
-    d->topo = s->topology;
+    d->topo = s->topology == 3 ? 0 : s->topology;   /* a strip: a list's pipeline */
     d->vs = vs;
     d->ninputs = ninputs;
     d->samples = V.cur_samples ? V.cur_samples : 1;
@@ -3493,6 +3814,15 @@ static int tex_get(const Nv2aVkTex *t, VkImageView *view, uint32_t *levels_out)
     uint32_t nregs = 0;
 
     d.filter = d.addr_u = d.addr_v = d.addr_p = 0;
+    /* Registers a format does not read hold whatever an earlier draw left:
+     * RSC2's DXT textures came with two or three pitches and palettes, and
+     * each was a texture of its own -- cached, checked every epoch and
+     * uploaded again. The palette is P8's only; swizzled and DXT textures
+     * have no pitch. (Found in the Switch port's GL renderer.) */
+    if (d.color != 0x0B)
+        d.palette = 0;
+    if (d.size_from_format)
+        d.pitch = 0;
     if (!d.valid || !d.width || !d.height || d.width > 4096 || d.height > 4096)
         { tex_fail(1, &d); return 0; }
     bytes = nv2a_pb_tex_bytes(&d);
@@ -4261,6 +4591,7 @@ static void ms_refresh(Surf *cs)
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.up_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -4525,6 +4856,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
@@ -5295,8 +5627,10 @@ static VkShaderModule module_file(const char *path, size_t skip, uint32_t *ninpu
     size_t n = 0;
     uint8_t *f = (uint8_t *)file_read(path, &n);
     if (f && n > skip && ((n - skip) & 3) == 0 && (!skip || !memcmp(f, "NVP1", 4))) {
-        if (ninputs)
+        if (ninputs) {
             memcpy(ninputs, f + 4, 4);
+            *ninputs &= 0xFFFF;         /* the top half: Prog.cmp */
+        }
         ci.codeSize = n - skip;
         ci.pCode = (const uint32_t *)(f + skip);
         if (vkCreateShaderModule(V.dev, &ci, NULL, &m) != VK_SUCCESS)
@@ -5543,7 +5877,9 @@ typedef struct {
     VkPipeline pipe;
     VkDescriptorSet set;
     uint32_t doff[2];
-    VkDeviceSize voff, ioff;
+    VtxBind vb;
+    uint32_t topo;
+    VkDeviceSize ioff;
     uint32_t nidx;
     VkViewport vp;
     VkRect2D sc;
@@ -5622,7 +5958,7 @@ static VkPipeline aux_pipeline(const Nv2aVkState *st, int kind, VkShaderModule v
 
 static void aux_record(const Nv2aVkState *st, int kind, VkShaderModule vs, uint32_t prog,
                        uint32_t ninputs, VkDescriptorSet set, const uint32_t *doff,
-                       VkDeviceSize voff, VkDeviceSize ioff, uint32_t nidx,
+                       const VtxBind *vb, VkDeviceSize ioff, uint32_t nidx,
                        const VkViewport *vp, const VkRect2D *sc, VkCullModeFlags cull,
                        VkFrontFace ff, const float *bc)
 {
@@ -5639,7 +5975,8 @@ static void aux_record(const Nv2aVkState *st, int kind, VkShaderModule vs, uint3
     a->set = set;
     a->doff[0] = doff[0];
     a->doff[1] = doff[1];
-    a->voff = voff;
+    a->vb = *vb;
+    a->topo = st->topology;
     a->ioff = ioff;
     a->nidx = nidx;
     a->vp = *vp;
@@ -5716,7 +6053,8 @@ static void aux_flush(void)
         V.bound_pipe = VK_NULL_HANDLE;
         vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                                 &a->set, 2, a->doff);
-        vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &a->voff);
+        vtx_bind(&a->vb);
+        topo_set(a->topo);
         vkCmdBindIndexBuffer(V.dcb, V.idx.buf, a->ioff, VK_INDEX_TYPE_UINT32);
         vkCmdSetViewport(V.dcb, 0, 1, &a->vp);
         vkCmdSetScissor(V.dcb, 0, 1, &a->sc);
@@ -5725,6 +6063,7 @@ static void aux_flush(void)
         vkCmdSetFrontFace(V.dcb, a->ff);
         vkCmdDrawIndexed(V.dcb, a->nidx, 1, 0, 0, 0);
     }
+    dyn_forget();
     vkCmdEndRendering(V.dcb);
     V.last_set = VK_NULL_HANDLE;
 }
@@ -5748,15 +6087,46 @@ static void aux_frame_end(void)
     V.aux_used = 0;
 }
 
+/* The dsc slot for these images and samplers: theirs if it is there (its
+ * gen then V.dsc_gen + 1), else the one to fill. NULL with the cache off. */
+static __typeof__(&V.dsc[0]) dset_find(const VkImageView *views, const VkSampler *samps)
+{
+    static int on = -1;
+    uint64_t h = 0;
+    __typeof__(&V.dsc[0]) e;
+    int i;
+    if (on < 0) {
+        const char *ev = getenv("RECOMP_VK_DSET_CACHE");
+        on = !(ev && strcmp(ev, "0") == 0);
+    }
+    if (!on)
+        return NULL;
+    for (i = 0; i < 8; i++)
+        h = (h ^ (uint64_t)(uintptr_t)views[i] ^ ((uint64_t)(uintptr_t)samps[i] << 7))
+            * 0x9E3779B97F4A7C15ull;
+    e = &V.dsc[(h >> 56) & 255];
+    if (e->gen == V.dsc_gen + 1 && (memcmp(e->views, views, sizeof e->views)
+                                     || memcmp(e->samps, samps, sizeof e->samps)))
+        e->gen = 0;                 /* another's: replaced */
+    return e;
+}
+
 static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
-                        uint32_t ninputs, const void *v, uint32_t nv,
+                        uint32_t ninputs, const void *v, const Nv2aVkVerts *vx, uint32_t nv,
                         const uint32_t *idx, uint32_t nidx)
 {
     VkImageView views[8];
     VkSampler samps[8];
     VkDeviceSize voff = 0, ioff = 0, uoff = 0, coff = 0;
-    VkDeviceSize vbytes = (VkDeviceSize)nv * ninputs * 16;
+    /* With `vx`: the title's bytes, then the converted inputs, then a
+     * (0, 0, 0, 1) for absent ones, each 16-byte aligned. */
+    VkDeviceSize rbytes = vx ? ((VkDeviceSize)vx->raw_bytes + 15) & ~(VkDeviceSize)15 : 0;
+    VkDeviceSize cbytes = vx ? (VkDeviceSize)nv * vx->nconv * 16 : 0;
+    VkDeviceSize vbytes = vx ? rbytes + cbytes + 16 : (VkDeviceSize)nv * ninputs * 16;
+    VtxBind vb;
+    uint32_t fi = 0;
     void *vp, *ip;
+    __typeof__(&V.dsc[0]) dsc = NULL;
     Nv2aVkUbo *ub, *ubm, ubl;
     VkPipeline pipe;
     VkDescriptorSet set;
@@ -5769,7 +6139,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     int ccw = st->front_face == 0x0901;
 
     if (dlog_active())
-        dlog_draw(st, prog, v, vbytes, idx, nidx);
+        dlog_draw(st, prog, vx ? vx->raw : v, vx ? vx->raw_bytes : vbytes, idx, nidx);
     {
         /* RECOMP_VK_SKIP_PROG=<hex>[,<hex>...]: drop those programs' draws,
          * to see what they are. */
@@ -5879,7 +6249,33 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         if (!vp || !ip || !ubm || !const_upload(&coff))
             return 1;
     }
-    memcpy(vp, v, (size_t)vbytes);
+    if (vx) {
+        static const float dflt[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        uint32_t i2;
+        if (vx->raw_bytes)
+            memcpy(vp, vx->raw, vx->raw_bytes);
+        if (cbytes)
+            memcpy((char *)vp + rbytes, vx->conv, (size_t)cbytes);
+        memcpy((char *)vp + rbytes + cbytes, dflt, 16);
+        vb.n = ninputs;
+        vb.nb = 3;
+        vb.stride[0] = vx->raw_stride;
+        vb.stride[1] = vx->nconv * 16;
+        vb.stride[2] = 0;
+        vb.boff[0] = voff;
+        vb.boff[1] = voff + rbytes;
+        vb.boff[2] = voff + rbytes + cbytes;
+        for (i2 = 0; i2 < ninputs; i2++) {
+            vb.bind[i2] = vx->src[i2];
+            vb.fmt[i2] = vx->src[i2] == NV2A_VS_RAW ? vfmt_vk(vx->fmt[i2])
+                                                     : VK_FORMAT_R32G32B32A32_SFLOAT;
+            vb.off[i2] = vx->src[i2] == NV2A_VS_RAW ? vx->off[i2]
+                       : vx->src[i2] == NV2A_VS_CONV ? 16u * vx->off[i2] : 0;
+        }
+    } else {
+        memcpy(vp, v, (size_t)vbytes);
+        vtx_float(&vb, ninputs, voff);
+    }
     memcpy(ip, idx, (size_t)nidx * 4);
 
     /* Per-draw constants. Built in ordinary memory and copied over once: the
@@ -6000,10 +6396,16 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     }
     memcpy(ubm, ub, sizeof *ub);
 
-    /* Descriptor set: reused while the images and samplers stay put. */
+    /* Descriptor set: reused while the images and samplers stay put, or
+     * found among this pool's (dsc). */
     if (V.last_set && !memcmp(views, V.last_views, sizeof views)
         && !memcmp(samps, V.last_samps, sizeof samps)) {
         set = V.last_set;
+    } else if ((dsc = dset_find(views, samps)) != NULL && dsc->gen == V.dsc_gen + 1) {
+        set = dsc->set;
+        V.last_set = set;
+        memcpy(V.last_views, views, sizeof views);
+        memcpy(V.last_samps, samps, sizeof samps);
     } else {
         VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         VkDescriptorImageInfo ii[8];
@@ -6048,6 +6450,12 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         V.last_set = set;
         memcpy(V.last_views, views, sizeof views);
         memcpy(V.last_samps, samps, sizeof samps);
+        if (dsc) {
+            memcpy(dsc->views, views, sizeof views);
+            memcpy(dsc->samps, samps, sizeof samps);
+            dsc->set = set;
+            dsc->gen = V.dsc_gen + 1;
+        }
     }
 
     {
@@ -6079,15 +6487,42 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     doff[1] = (uint32_t)coff;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                             &set, 2, doff);
-    vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &voff);
-    vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
-    vkCmdSetViewport(V.dcb, 0, 1, &vpt);
+    {
+        /* RECOMP_VK_DYN_CACHE=0: every state set again at every draw. */
+        static int cache = -1;
+        if (cache < 0) {
+            const char *e = getenv("RECOMP_VK_DYN_CACHE");
+            cache = !(e && strcmp(e, "0") == 0);
+        }
+        if (!cache)
+            dyn_forget();
+    }
+    vtx_bind(&vb);
+    topo_set(st->topology);
+    if (!V.idx_bound) {
+        vkCmdBindIndexBuffer(V.dcb, V.idx.buf, 0, VK_INDEX_TYPE_UINT32);
+        V.idx_bound = 1;
+    }
+    fi = (uint32_t)(ioff / 4);
     sc = clip_rect(st);
     if (!sc.extent.width || !sc.extent.height)
         return 1;
-    vkCmdSetScissor(V.dcb, 0, 1, &sc);
     nv2a_rc_unpack(st->blend_color, bc);
-    vkCmdSetBlendConstants(V.dcb, bc);
+#define DYN_SET(field, val, call) do { \
+        if (!V.dyn_valid || V.dyn.field != (val)) { call; V.dyn.field = (val); } \
+    } while (0)
+    if (!V.dyn_valid || memcmp(&V.dyn.vp, &vpt, sizeof vpt)) {
+        vkCmdSetViewport(V.dcb, 0, 1, &vpt);
+        V.dyn.vp = vpt;
+    }
+    if (!V.dyn_valid || memcmp(&V.dyn.sc, &sc, sizeof sc)) {
+        vkCmdSetScissor(V.dcb, 0, 1, &sc);
+        V.dyn.sc = sc;
+    }
+    if (!V.dyn_valid || memcmp(V.dyn.bc, bc, sizeof bc)) {
+        vkCmdSetBlendConstants(V.dcb, bc);
+        memcpy(V.dyn.bc, bc, sizeof bc);
+    }
     {
         /* RECOMP_VK_CULL=0 draws both faces whatever the title asks;
          * RECOMP_VK_FLIP_FRONT swaps the winding meaning. */
@@ -6106,22 +6541,39 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         }
         if (flip)
             ccw = !ccw;
-        vkCmdSetCullMode(V.dcb, cm);
-        vkCmdSetFrontFace(V.dcb, ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE
-                                     : VK_FRONT_FACE_CLOCKWISE);
+        DYN_SET(cull, (uint32_t)cm, vkCmdSetCullMode(V.dcb, cm));
+        DYN_SET(ff, (uint32_t)ccw, vkCmdSetFrontFace(V.dcb, ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                               : VK_FRONT_FACE_CLOCKWISE));
     }
-    vkCmdSetDepthTestEnable(V.dcb, V.cur_zs && st->depth_test);
-    vkCmdSetDepthWriteEnable(V.dcb, V.cur_zs && st->depth_test && st->depth_mask);
-    vkCmdSetDepthCompareOp(V.dcb, compare_op(depth_mode(st) == 2 ? depth_func_rev(st->depth_func)
-                                                                  : st->depth_func));
-    vkCmdSetStencilTestEnable(V.dcb, V.cur_zs && st->st_test);
-    vkCmdSetStencilOp(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_op(st->st_fail),
-                      stencil_op(st->st_zpass), stencil_op(st->st_zfail),
-                      compare_op(st->st_func));
-    vkCmdSetStencilCompareMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_mask & 0xFF);
-    vkCmdSetStencilWriteMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK,
-                             st->st_write ? (st->st_wmask & 0xFF) : 0);
-    vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
+    {
+        uint32_t dt = V.cur_zs && st->depth_test, dw = dt && st->depth_mask;
+        VkCompareOp dco = compare_op(depth_mode(st) == 2 ? depth_func_rev(st->depth_func)
+                                                         : st->depth_func);
+        uint32_t ste = V.cur_zs && st->st_test;
+        VkStencilOp sf = stencil_op(st->st_fail), sp = stencil_op(st->st_zpass);
+        VkStencilOp sz = stencil_op(st->st_zfail);
+        VkCompareOp sfn = compare_op(st->st_func);
+        uint32_t swm = st->st_write ? (st->st_wmask & 0xFF) : 0;
+        DYN_SET(dt, dt, vkCmdSetDepthTestEnable(V.dcb, dt));
+        DYN_SET(dw, dw, vkCmdSetDepthWriteEnable(V.dcb, dw));
+        DYN_SET(dco, (uint32_t)dco, vkCmdSetDepthCompareOp(V.dcb, dco));
+        DYN_SET(ste, ste, vkCmdSetStencilTestEnable(V.dcb, ste));
+        if (!V.dyn_valid || V.dyn.sop[0] != (uint32_t)sf || V.dyn.sop[1] != (uint32_t)sp
+                || V.dyn.sop[2] != (uint32_t)sz || V.dyn.sop[3] != (uint32_t)sfn) {
+            vkCmdSetStencilOp(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, sf, sp, sz, sfn);
+            V.dyn.sop[0] = (uint32_t)sf;
+            V.dyn.sop[1] = (uint32_t)sp;
+            V.dyn.sop[2] = (uint32_t)sz;
+            V.dyn.sop[3] = (uint32_t)sfn;
+        }
+        DYN_SET(scm, st->st_mask & 0xFF,
+                vkCmdSetStencilCompareMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_mask & 0xFF));
+        DYN_SET(swm, swm, vkCmdSetStencilWriteMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, swm));
+        DYN_SET(sref, st->st_ref & 0xFF,
+                vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF));
+        V.dyn_valid = 1;
+    }
+#undef DYN_SET
     if (zpass_trace() && V.cur_zs && st->st_test && st->st_write && (st->st_wmask & 0xFF)
             && !V.zpass && V.cur_cs && V.cur_cs->w == 640)
         fprintf(stderr, "[ZPASS] F%u stencil-write prog %08X nidx %u depth %u %X st func %X ref %X mask %X"
@@ -6140,7 +6592,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                     st->st_test, st->st_func, st->st_ref, st->st_mask, st->color_mask, st->alpha_test,
                     st->alpha_func, st->alpha_ref, st->clip_x, st->clip_y, st->clip_w, st->clip_h);
         vkCmdBeginQuery(V.dcb, V.qpool, q, V.precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-        vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+        vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
         vkCmdEndQuery(V.dcb, V.qpool, q);
         if (zpass_trace() && getenv("RECOMP_VK_ZPASS_PROBE") && st->st_test && st->st_func == 0x202) {
             /* Which stencil values lie under this test: the same draw
@@ -6164,14 +6616,14 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 uint32_t doff[2] = { (uint32_t)uoff, (uint32_t)coff };
                 vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1, &set, 2, doff);
             }
-            vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &voff);
-            vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
+            vtx_bind(&vb);
+            vkCmdBindIndexBuffer(V.dcb, V.idx.buf, 0, VK_INDEX_TYPE_UINT32);
             vkCmdSetViewport(V.dcb, 0, 1, &vpt);
             vkCmdSetScissor(V.dcb, 0, 1, &sc);
             for (k = 0; k < 6; k++) {
                 vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, refs[k]);
                 vkCmdBeginQuery(V.dcb, dq, (uint32_t)k, 0);
-                vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+                vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
                 vkCmdEndQuery(V.dcb, dq, (uint32_t)k);
             }
             vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
@@ -6188,7 +6640,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, vp2);
                     V.bound_pipe = VK_NULL_HANDLE;
                     vkCmdSetStencilTestEnable(V.dcb, VK_FALSE);
-                    vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+                    vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
                     mark_drawn(st);
                 }
             }
@@ -6234,6 +6686,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 fprintf(stderr, "[ZPASS] stencil under the test: 00:%llu 01:%llu 14:%llu C8:%llu C9:%llu FF:%llu\n",
                         (unsigned long long)res[0], (unsigned long long)res[1], (unsigned long long)res[2],
                         (unsigned long long)res[3], (unsigned long long)res[4], (unsigned long long)res[5]);
+            dyn_forget();
             return 1;
         }
     } else if (s_flight > 0 && s_dlog && V.fqpool && V.nfq < VK_MAX_QUERIES) {
@@ -6243,10 +6696,10 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         V.fq_frame[q] = nv2a_pb_presented_frames();
         V.fq_seq[q] = s_dlog_seq - 1;
         vkCmdBeginQuery(V.dcb, V.fqpool, q, V.precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-        vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+        vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
         vkCmdEndQuery(V.dcb, V.fqpool, q);
     } else {
-        vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+        vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
     }
     if (V.cur_cs && V.cur_cs->w >= 640 && !V.cur_cs->swz && s_probe_nq < 4096
         && probe_active()) {
@@ -6287,13 +6740,13 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     {
         int kind = aux_kind(st);
         if (kind)
-            aux_record(st, kind, vs, prog, ninputs, set, doff, voff, ioff, nidx, &vpt, &sc, cm,
+            aux_record(st, kind, vs, prog, ninputs, set, doff, &vb, ioff, nidx, &vpt, &sc, cm,
                        ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE, bc);
     }
     mark_drawn(st);
     V.st_draws++;
     V.seg_draws++;
-    V.st_tris += nidx / 3;
+    V.st_tris += st->topology == 3 ? nidx - 2 : nidx / 3;
     return 1;
 }
 
@@ -6302,7 +6755,7 @@ void nv2a_vk_draw(const Nv2aVkState *st, const Nv2aVshOutput *v, uint32_t nv,
 {
     if (!nidx || !nv || !nv2a_vk_active())
         return;
-    (void)draw_common(st, V.vs, 0, sizeof *v / 16, v, nv, idx, nidx);
+    (void)draw_common(st, V.vs, 0, sizeof *v / 16, v, NULL, nv, idx, nidx);
 }
 
 /* ---- title vertex programs on the GPU ----------------------------------- */
@@ -6471,7 +6924,13 @@ static int prog_load_cached(Prog *p)
         f = (uint8_t *)file_read(path, &n);
     }
     if (f && n > 24 && !memcmp(f, "NVP1", 4) && ((n - 24) & 3) == 0) {
-        memcpy(&p->ninputs, f + 4, 4);
+        uint32_t w;
+        memcpy(&w, f + 4, 4);
+        if ((w >> 16) != p->cmp) {      /* another's id, by a fluke */
+            free(f);
+            return 0;
+        }
+        p->ninputs = w & 0xFFFF;
         memcpy(p->inputs, f + 8, 16);
         ci.codeSize = n - 24;
         ci.pCode = (const uint32_t *)(f + 24);
@@ -6499,9 +6958,20 @@ static char *prog_source(Prog *p)
         return NULL;
     q = src;
     q += sprintf(q, "%s", k_prog_head);
+    if (p->cmp)
+        q += sprintf(q, "vec4 cmp_decode(uint u) {\n"
+                        "    return vec4(float(int(u << 21) >> 21) / 1023.0,\n"
+                        "                float(int(u << 10) >> 21) / 1023.0,\n"
+                        "                float(int(u) >> 22) / 511.0, 1.0);\n"
+                        "}\n");
     for (i = 0, j = 0; i < 16; i++)
         if (inmask & (1u << i)) {
-            q += sprintf(q, "layout(location = %u) in vec4 v%u;\n", j, i);
+            if (p->cmp & (1u << i))
+                q += sprintf(q, "layout(location = %u) in uvec2 v%u_p;\n"
+                                "#define v%u cmp_decode(v%u_p.x | (v%u_p.y << 16))\n",
+                             j, i, i, i, i);
+            else
+                q += sprintf(q, "layout(location = %u) in vec4 v%u;\n", j, i);
             p->inputs[j++] = (uint8_t)i;
         }
     p->ninputs = j;
@@ -6530,8 +7000,9 @@ static void prog_build(Prog *p, char *src)
             if (dir) {
                 char path[1100];
                 uint8_t hdr[24];
+                uint32_t w = p->ninputs | (uint32_t)p->cmp << 16;
                 memcpy(hdr, "NVP1", 4);
-                memcpy(hdr + 4, &p->ninputs, 4);
+                memcpy(hdr + 4, &w, 4);
                 memcpy(hdr + 8, p->inputs, 16);
                 snprintf(path, sizeof path, "%s/prog_v%u_%08X.spv", dir, VK_PROG_VERSION, p->hash);
                 file_write(path, hdr, sizeof hdr, ci.pCode, ci.codeSize);
@@ -6547,8 +7018,9 @@ static void prog_build(Prog *p, char *src)
 /* The program `hash`, the one loaded now: from the disk cache at once, or
  * compiled on the worker (state 2 until then; nv2a_vk_program says -1 and
  * the executor runs it on the CPU meanwhile). */
-static Prog *prog_get(uint32_t hash)
+static Prog *prog_get_cmp(uint32_t base, uint16_t cmp)
 {
+    uint32_t hash = prog_id(base, cmp);
     uint32_t slot = (hash * 2654435761u) & (VK_MAX_PROGS - 1), n;
     for (n = 0; n < VK_MAX_PROGS; n++) {
         Prog *p = &V.progs[(slot + n) & (VK_MAX_PROGS - 1)];
@@ -6556,6 +7028,8 @@ static Prog *prog_get(uint32_t hash)
             double t0 = now_ms();
             char *src;
             p->hash = hash;
+            p->base = base;
+            p->cmp = cmp;
             if (prog_load_cached(p)) {
                 p->state = 1;
             } else if (!(src = prog_source(p))) {
@@ -6574,10 +7048,24 @@ static Prog *prog_get(uint32_t hash)
             V.st_compiles++;
             return p;
         }
-        if (p->hash == hash)
+        if (p->hash == hash && p->base == base && p->cmp == cmp)
             return p;
     }
     return NULL;
+}
+
+static Prog *prog_get(uint32_t hash)
+{
+    return prog_get_cmp(hash, 0);
+}
+
+int nv2a_vk_program_cmp(uint32_t hash, uint16_t cmp)
+{
+    Prog *p;
+    if (!nv2a_vk_active() || !V.vi_dyn || !V.vf_ok[NV2A_VF_CMP])
+        return 0;
+    p = prog_get_cmp(hash, cmp);
+    return p && __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) == 1;
 }
 
 int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
@@ -6604,7 +7092,39 @@ int nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
     p = prog_get(hash);
     if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
         return 0;
-    return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, vin, nv, idx, nidx);
+    return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, vin, NULL, nv, idx, nidx);
+}
+
+int nv2a_vk_strips(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_STRIPS");
+        on = !(e && strcmp(e, "0") == 0);
+    }
+    return on && nv2a_vk_active();
+}
+
+int nv2a_vk_raw_verts(void)
+{
+    return nv2a_vk_active() && V.vi_dyn;
+}
+
+int nv2a_vk_vfmt_ok(int fmt)
+{
+    return fmt >= 0 && fmt < NV2A_VF_COUNT && V.vf_ok[fmt];
+}
+
+int nv2a_vk_draw_program_raw(const Nv2aVkState *st, uint32_t hash, const Nv2aVkVerts *vx,
+                             uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{
+    Prog *p;
+    if (!nidx || !nv || !nv2a_vk_active())
+        return 1;
+    p = prog_get_cmp(hash, vx->cmp);
+    if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
+        return 0;
+    return draw_common(st, p->vs, p->hash, p->ninputs ? p->ninputs : 1, NULL, vx, nv, idx, nidx);
 }
 
 
@@ -7248,6 +7768,7 @@ static void touch_pass(VkImageView view)
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.touch_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -7366,6 +7887,7 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     pc[0] = (float)ox;
     pc[1] = (float)oy;

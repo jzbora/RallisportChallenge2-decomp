@@ -2992,7 +2992,8 @@ uint32_t nv2a_pb_tex_bytes(const Nv2aVkTex *d)
     return n;
 }
 
-/* The topology vk_tri_list produced: 0 triangles, 1 lines, 2 points. */
+/* The topology vk_tri_list produced: 0 triangles, 1 lines, 2 points, 3 a
+ * triangle strip. */
 static uint32_t s_vk_topo;
 
 static void vk_state(Nv2aVkState *v)
@@ -3139,6 +3140,15 @@ static uint32_t vk_tri_list(uint32_t n)
         }
         break;
     case NV_PRIM_TRIANGLE_STRIP:
+        if (n >= 3 && nv2a_vk_strips()) {
+            /* Drawn as a strip: no list of three indices a triangle to
+             * build here (and remap, and copy), which was a tenth of the
+             * executor in the paused race. RECOMP_VK_STRIPS=0 for the list. */
+            for (i = 0; i < n; i++)
+                s_vk_idx[i] = i;
+            s_vk_topo = 3;
+            return n;
+        }
         for (i = 0; i + 2 < n; i++) {
             s_vk_idx[k++] = (i & 1) ? i + 1 : i;
             s_vk_idx[k++] = (i & 1) ? i : i + 1;
@@ -3209,13 +3219,150 @@ static void vk_draw_batch(const Nv2aVshOutput *v, uint32_t n, Nv2aVkState *st)
  * and lets the indices share vertices; otherwise one vertex per index. */
 static uint32_t k_or_1(uint32_t kk) { return kk ? kk : 1; }
 
+/* An attribute's format as the GPU can read it (NV2A_VF_*), and the size
+ * of its components; -1 for one it cannot (the packed normal, unless the
+ * program's variant decodes it: `cmp`). */
+static int vk_vfmt(const VertexAttr *a, uint32_t *csize, int cmp)
+{
+    uint32_t n = a->size < 4 ? a->size : 4;
+    switch (a->type) {
+    case 6: *csize = 2; return cmp ? NV2A_VF_CMP : -1;   /* as two halves */
+    case 0: *csize = 1; return a->size == 4 ? NV2A_VF_BGRA8 : -1;
+    case 2: *csize = 4; return NV2A_VF_F32 + (int)n - 1;
+    case 4: *csize = 1; return NV2A_VF_UN8 + (int)n - 1;
+    case 1: *csize = 2; return NV2A_VF_SN16 + (int)n - 1;
+    case 5: *csize = 2; return NV2A_VF_SS16 + (int)n - 1;
+    default: return -1;
+    }
+}
+
+/* The program's inputs for vertices lo..lo+nv-1 as the title laid them
+ * out (nv2a_vk_draw_program_raw): those in one interleaved stream, in a
+ * format the GPU reads, go as the stream's bytes; the rest are converted
+ * here into `conv`. 0 when nothing would be gained: draw it the old way. */
+static int vk_raw_verts(uint32_t h, const uint8_t *ins, uint32_t kk, uint32_t lo, uint32_t nv,
+                        float *conv, Nv2aVkVerts *vx)
+{
+    const uint8_t *base;
+    uint32_t i, st0 = 0, bo = 0xFFFFFFFFu, end = 0, nraw = 0, nnone = 0, cs;
+    int f[16], cmp_ok = 0;
+    uint16_t cmp = 0;
+
+    memset(vx, 0, sizeof *vx);
+    if (!kk) {
+        vx->src[0] = NV2A_VS_NONE;
+        return 1;
+    }
+    /* Packed normals: read as they are by the program's variant that
+     * decodes them, once it is built (RECOMP_VK_CMP=0: never). */
+    {
+        static int on = -1;
+        if (on < 0) {
+            const char *e = getenv("RECOMP_VK_CMP");
+            on = !(e && strcmp(e, "0") == 0);
+        }
+        for (i = 0; on && i < kk; i++) {
+            const VertexAttr *a = &s_gpu.attr[ins[i]];
+            if (a->type == 6 && a->size && a->stride && (s_gpu.inline_active || a->offset))
+                cmp |= (uint16_t)(1u << ins[i]);
+        }
+        cmp_ok = cmp && nv2a_vk_program_cmp(h, cmp);
+    }
+    for (i = 0; i < kk; i++) {
+        const VertexAttr *a = &s_gpu.attr[ins[i]];
+        f[i] = -1;
+        if (!a->size || !a->stride || (!s_gpu.inline_active && !a->offset)) {
+            vx->src[i] = NV2A_VS_NONE;      /* reads (0, 0, 0, 1) */
+            nnone++;
+            continue;
+        }
+        vx->src[i] = NV2A_VS_CONV;
+        f[i] = vk_vfmt(a, &cs, cmp_ok);
+        if (f[i] < 0 || !nv2a_vk_vfmt_ok(f[i]) || (a->stride % cs)) {
+            f[i] = -1;
+            continue;
+        }
+        if (!st0)
+            st0 = a->stride;
+        if (a->stride == st0 && a->offset < bo)
+            bo = a->offset;
+    }
+    /* One stream: the inputs within a vertex of the first one's stride. */
+    for (i = 0; i < kk && st0; i++) {
+        const VertexAttr *a = &s_gpu.attr[ins[i]];
+        uint32_t e;
+        if (f[i] < 0 || a->stride != st0 || a->offset - bo >= st0)
+            continue;
+        (void)vk_vfmt(a, &cs, cmp_ok);
+        if ((a->offset - bo) % cs)
+            continue;
+        e = a->offset - bo + (f[i] == NV2A_VF_BGRA8 || f[i] == NV2A_VF_CMP ? 4
+                              : (a->size < 4 ? a->size : 4) * cs);
+        if (e > end)
+            end = e;
+        vx->src[i] = NV2A_VS_RAW;
+        vx->fmt[i] = (uint8_t)f[i];
+        vx->off[i] = (uint16_t)(a->offset - bo);
+        nraw++;
+    }
+    if (nraw) {
+        vx->raw_stride = st0;
+        vx->raw_bytes = (nv - 1) * st0 + end;
+        if (s_gpu.inline_active) {
+            /* Some of the stream past the payload's end: fetch_attr's
+             * (0, 0, 0, 1) for those, so convert them all. */
+            if ((size_t)bo + (size_t)(lo + nv - 1) * st0 + end > (size_t)s_gpu.inline_count * 4) {
+                for (i = 0; i < kk; i++)
+                    if (vx->src[i] == NV2A_VS_RAW)
+                        vx->src[i] = NV2A_VS_CONV;
+                nraw = 0;
+            }
+            base = (const uint8_t *)s_gpu.inline_buf;
+        } else {
+            base = (const uint8_t *)xbox_GetMemoryOffset();
+        }
+        vx->raw = base + bo + (size_t)lo * st0;
+    }
+    if (cmp_ok) {
+        /* The variant reads every one of its packed inputs from the stream:
+         * if one did not make it there, convert them all instead. */
+        uint16_t got = 0;
+        for (i = 0; i < kk; i++)
+            if (vx->src[i] == NV2A_VS_RAW && vx->fmt[i] == NV2A_VF_CMP)
+                got |= (uint16_t)(1u << ins[i]);
+        if (got != cmp) {
+            for (i = 0; i < kk; i++)
+                if (vx->src[i] == NV2A_VS_RAW && vx->fmt[i] == NV2A_VF_CMP) {
+                    vx->src[i] = NV2A_VS_CONV;
+                    nraw--;
+                }
+            got = 0;
+        }
+        vx->cmp = got;
+    }
+    if (!nraw && !nnone)
+        return 0;
+    if (!nraw)
+        vx->raw_bytes = vx->raw_stride = 0;
+    for (i = 0; i < kk; i++)
+        if (vx->src[i] == NV2A_VS_CONV)
+            vx->off[i] = (uint16_t)vx->nconv++;
+    for (i = 0; i < kk; i++)
+        if (vx->src[i] == NV2A_VS_CONV)
+            fetch_attr_run(&s_gpu.attr[ins[i]], lo, NULL, nv, conv + (size_t)vx->off[i] * 4,
+                           (size_t)vx->nconv * 4);
+    vx->conv = conv;
+    return 1;
+}
+
 static int vk_program_batch(void)
 {
     static float *vin;
     uint8_t ins[16];
     uint32_t h, n = s_gpu.idx_count, i, j, lo, hi, nv, k, kk, ranged;
-    int got;
+    int got, raw;
     Nv2aVkState st;
+    Nv2aVkVerts vx;
 
     if (!nv2a_vk_active())
         return 0;
@@ -3237,16 +3384,20 @@ static int vk_program_batch(void)
     }
     ranged = hi - lo < NV_MAX_INDICES && hi - lo + 1 <= 2 * n + 64;
     nv = ranged ? hi - lo + 1 : n;
-    if (!kk)
+    /* The title's vertices handed over as they are, when the GPU can take
+     * them (RECOMP_VK_RAW_VERTS=0 not): the paused race's executor spent a
+     * quarter of its time making floats of them. */
+    raw = ranged && nv2a_vk_raw_verts() && vk_raw_verts(h, ins, kk, lo, nv, vin, &vx);
+    if (!raw && !kk)
         for (j = 0; j < nv; j++) {
             float *o = vin + (size_t)j * 4;
             o[0] = o[1] = o[2] = 0.0f;
             o[3] = 1.0f;
         }
-    for (i = 0; i < kk; i++)
+    for (i = 0; i < kk && !raw; i++)
         fetch_attr_run(&s_gpu.attr[ins[i]], ranged ? lo : 0, ranged ? NULL : s_gpu.idx,
                        nv, vin + (size_t)i * 4, (size_t)k * 4);
-    {
+    if (!raw) {
         /* RECOMP_PB_FETCH_CHECK=1: every batch fetched again vertex by
          * vertex (fetch_attr), compared bit for bit with the fast path. */
         static int check = -1;
@@ -3289,7 +3440,7 @@ static int vk_program_batch(void)
             const char *e = getenv("RECOMP_VSH_DUMP");
             want = e ? (long)strtoul(e, NULL, 16) : -1;
         }
-        if (want >= 0 && (uint32_t)want == h && shown < (getenv("RECOMP_VSH_DUMP_N") ? atoi(getenv("RECOMP_VSH_DUMP_N")) : 24)) {
+        if (!raw && want >= 0 && (uint32_t)want == h && shown < (getenv("RECOMP_VSH_DUMP_N") ? atoi(getenv("RECOMP_VSH_DUMP_N")) : 24)) {
             uint32_t vv;
             shown++;
             fprintf(stderr, "[VSHDUMP] F%u prog %08X nv %u prim %u inputs", s_presented, h, nv, s_gpu.prim);
@@ -3312,7 +3463,8 @@ static int vk_program_batch(void)
         }
     }
     vk_state(&st);
-    if (!nv2a_vk_draw_program(&st, h, vin, nv, s_vk_idx, k))
+    if (!(raw ? nv2a_vk_draw_program_raw(&st, h, &vx, nv, s_vk_idx, k)
+              : nv2a_vk_draw_program(&st, h, vin, nv, s_vk_idx, k)))
         return 0;                       /* still compiling: the CPU path draws it */
     s_gpu.tris_drawn += k / 3;
     s_gpu.xf_drawn += k / 3;
@@ -3847,7 +3999,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && s_gpu.draws <= 2000)   /* is it drawing at all */
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -4506,10 +4658,28 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        if (method == 0x0310) {
+            /* The pattern object's SET_MONOCHROME_COLOR0 lands in PGRAPH's
+             * PATT_COLOR0 (0x400B10), and D3D uses that as the GPU's
+             * progress counter: it queues the colour in the stream and
+             * polls the register while waiting for push-buffer space.
+             * Written in stream order, as the GPU would. */
+            extern void xbox_Nv2aPatternColor0(uint32_t v);
+            xbox_Nv2aPatternColor0(param);
+            return;
+        }
         note_unhandled(method, param);
         return;
     }
     switch (method) {
+    case 0x0100:                            /* NO_OPERATION */
+        if (param) {
+            /* A notify for the CPU (nv2a_irq.c, with RECOMP_NV2A_PFB_ASYNC):
+             * D3D patches one in when it waits for push-buffer room. */
+            extern int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param);
+            xbox_Nv2aIrqNotify(subch, method, param);
+        }
+        return;
     case NV097_SET_SEMAPHORE_OFFSET:
         s_sem_offset = param;
         return;

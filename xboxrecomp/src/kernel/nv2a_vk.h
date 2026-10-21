@@ -46,7 +46,7 @@ typedef struct {
     uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation;
     uint32_t blend_color, color_mask;
     uint32_t depth_test, depth_func, depth_mask, wbuffer, zint;
-    uint32_t topology;          /* 0 triangles, 1 lines, 2 points */
+    uint32_t topology;          /* 0 triangles, 1 lines, 2 points, 3 a strip */
     float    point_size;        /* SET_POINT_SIZE, pixels */
     uint32_t point_params;      /* SET_POINT_PARAMS_ENABLE: size from oPts */
     uint32_t point_sprite;      /* SET_POINT_SMOOTH_ENABLE: stage 3 = point coord */
@@ -83,6 +83,48 @@ int  nv2a_vk_program(uint32_t hash, uint8_t inputs[16]);
  * its pipeline is still being built on the worker: draw it another way. */
 int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
                          uint32_t nv, const uint32_t *idx, uint32_t nidx);
+
+/* The same draw with the inputs as the title laid them out, for the GPU to
+ * read and convert itself (VK_EXT_vertex_input_dynamic_state): the
+ * vertices' bytes copied as they are, rather than turned into four floats
+ * an input on the CPU. An input whose format Vulkan has no match for (the
+ * packed 11:11:10 normal) comes converted, in `conv`; one the title does
+ * not supply reads (0, 0, 0, 1). */
+enum {
+    NV2A_VF_F32 = 0,            /* + size - 1: float, 1 to 4 components */
+    NV2A_VF_UN8 = 4,            /* unsigned byte, normalised */
+    NV2A_VF_SN16 = 8,           /* signed short, normalised */
+    NV2A_VF_SS16 = 12,          /* signed short, as is */
+    NV2A_VF_BGRA8 = 16,         /* D3DCOLOR */
+    NV2A_VF_CMP = 17,           /* the packed 11:11:10 normal, decoded by the
+                                 * program's variant (Nv2aVkVerts.cmp) */
+    NV2A_VF_COUNT
+};
+enum { NV2A_VS_RAW, NV2A_VS_CONV, NV2A_VS_NONE };
+typedef struct {
+    const void *raw;            /* vertex 0's first byte */
+    uint32_t raw_bytes, raw_stride;
+    const float *conv;          /* `nconv` float4s a vertex */
+    uint32_t nconv;
+    uint8_t src[16];            /* per input, NV2A_VS_* */
+    uint8_t fmt[16];            /* NV2A_VS_RAW: NV2A_VF_* */
+    uint16_t off[16];           /* RAW: byte offset in a vertex; CONV: its slot */
+    uint16_t cmp;               /* v-registers read as NV2A_VF_CMP, by bit */
+} Nv2aVkVerts;
+
+/* 1 when a triangle strip can be drawn as one (topology 3) rather than
+ * made into a list. */
+int nv2a_vk_strips(void);
+
+/* 1 when nv2a_vk_draw_program_raw can be used, and for which formats. */
+int nv2a_vk_raw_verts(void);
+int nv2a_vk_vfmt_ok(int fmt);
+/* The program `hash` built to decode the packed normals in the v-registers
+ * of `cmp` itself: 1 when it is ready (it is built on the worker when
+ * first asked for; meanwhile they are converted on the CPU). */
+int nv2a_vk_program_cmp(uint32_t hash, uint16_t cmp);
+int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVerts *vx,
+                             uint32_t nv, const uint32_t *idx, uint32_t nidx);
 
 /* CLEAR_SURFACE: `flags` is its parameter (0x01 Z, 0x02 stencil, 0xF0
  * colour), `argb` the colour clear value, `zs` ZSTENCIL_CLEAR_VALUE. */

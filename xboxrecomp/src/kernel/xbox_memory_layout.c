@@ -930,6 +930,11 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
+/* RECOMP_NV2A_TRACE itself: a line at every kick and scan-out change. Not
+ * with the executor alone -- half a million lines in a minute and a half,
+ * and on the Switch over nxlink each was a blocking socket write, about
+ * 13% of the executor's time in a race. */
+static int s_nv2a_kick_trace = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -993,6 +998,42 @@ static void framebuffer_probe_tick(void)
  * acknowledges a PFB flush -- every D3D kick waits for one. */
 static uint64_t s_ack_loops, s_ack_clears, s_ack_scan_us;
 static int s_ack_stats;
+
+/* Set when the loop below clears the PFB flush: D3D's wait for it
+ * (rsc2_overrides.c, sub_003683A0) sleeps on this rather than spinning.
+ * The title flushes and waits for the executor to drain at every frame,
+ * and at a 60 fps cap the executor spends most of it asleep at the flip:
+ * the spin held a core at 100% for nothing. */
+static HANDLE s_flush_event;
+
+void xbox_Nv2aFlushWait(void)
+{
+    if (s_flush_event)
+        WaitForSingleObject(s_flush_event, 1);
+    else
+        Sleep(0);
+}
+
+/* DMA_GET from the executor as it goes (nv2a_pb_scan.c): the physical
+ * address of the next word it will read, as the GPU reports it. */
+void xbox_Nv2aProgressGet(uint32_t va)
+{
+    if (g_nv2a_memory)
+        __atomic_store_n((volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_GET),
+                         va & 0x0FFFFFFFu, __ATOMIC_RELEASE);
+}
+
+/* PGRAPH PATT_COLOR0 from the executor (nv2a_pb_exec.c, method 0x0310 of
+ * the pattern object): D3D's GPU progress counter. */
+void xbox_Nv2aPatternColor0(uint32_t v)
+{
+    extern int xbox_Nv2aIrqPoke(uint32_t off, uint32_t v);
+    if (xbox_Nv2aIrqPoke(0x400B10, v))
+        return;
+    if (g_nv2a_memory)
+        __atomic_store_n((volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10), v,
+                         __ATOMIC_RELEASE);
+}
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
@@ -1182,17 +1223,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                if (s_nv2a_trace) {
+                if (s_nv2a_kick_trace) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
-        if (s_nv2a_trace) {
+        if (s_nv2a_kick_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = xbox_Nv2aIrqEnabled() ? xbox_Nv2aIrqPeek(0x600800)
                            : *(volatile uint32_t *)((char *)regs + 0x600800);
@@ -1222,6 +1263,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 if (*r & NV2A_ACK[0].busy_mask) {
                     *r &= ~NV2A_ACK[0].busy_mask;
                     s_ack_clears++;
+                    if (s_flush_event)
+                        SetEvent(s_flush_event);
                 }
             }
             for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -1270,6 +1313,7 @@ static void xbox_Nv2aAckStart(void)
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    s_flush_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
@@ -2670,6 +2714,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
+        s_nv2a_kick_trace = getenv("RECOMP_NV2A_TRACE") != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
