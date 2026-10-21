@@ -230,6 +230,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        /* Closing the host window must stop the title too. Merely clearing
+         * s_fb_running lets the next guest display-mode call start another
+         * window while the old rendering thread is still tearing down. The
+         * SDL host likewise terminates the process on an explicit close. */
+        fprintf(stderr, "  [FBWIN] window closed -- exiting\n");
+        fflush(stderr);
+        ExitProcess(0);
+        return 0;
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
