@@ -7,6 +7,23 @@ ROOT = Path(__file__).resolve().parent
 ORIGINAL = ROOT / 'RalliSport2'
 OUTPUT = ROOT / 'rsc2-zh-pilot'
 FONT_PATH = ROOT / 'third_party/fonts/NotoSansCJKsc-Bold.otf'
+
+def font_copyright(path):
+    """Retain the source font's copyright when generating bitmap glyphs."""
+    raw=Path(path).read_bytes()
+    count=struct.unpack_from('>H',raw,4)[0]
+    for i in range(count):
+        tag,checksum,offset,length=struct.unpack_from('>4sIII',raw,12+i*16)
+        if tag!=b'name': continue
+        _,n,strings=struct.unpack_from('>3H',raw,offset)
+        notices=set()
+        for j in range(n):
+            platform,encoding,language,name,size,relative=struct.unpack_from('>6H',raw,offset+6+j*12)
+            if name==0:
+                text=raw[offset+strings+relative:offset+strings+relative+size]
+                notices.add(text.decode('utf-16be' if platform in (0,3) else 'mac_roman'))
+        if notices:return '\n'.join(sorted(notices))
+    raise ValueError('Font copyright metadata missing; supply a font with complete license metadata')
 TRANSLATIONS = {
     'LID_HEAD_MAIN': '主菜单',
     'LID_HEAD_OPTIONS': '设置',
@@ -232,6 +249,9 @@ def main():
     (ROOT / 'font-probe').mkdir(exist_ok=True)
     (OUTPUT/'licenses').mkdir(exist_ok=True)
     shutil.copy2(args.font_license, OUTPUT/'licenses/CJK-FONT-LICENSE.txt')
+    (OUTPUT/'licenses/CJK-FONT-NOTICE.txt').write_text(
+        font_copyright(FONT_PATH)+'\nChinese glyphs generated from '+FONT_PATH.name+
+        '. Generated CJK glyph data retains the source font license. Original game assets retain their original rights.\n',encoding='utf-8')
     (OUTPUT / 'portable-mode.txt').write_text('Per-install cache and settings.\n', encoding='ascii')
     settings = OUTPUT / 'portable-data' / 'Settings'
     settings.mkdir(parents=True, exist_ok=True)
