@@ -92,6 +92,7 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/menu_exit.c         # native controller-selectable quit choices
     src/rsc2_overrides.c    # hand-written sub_XXXXXXXX (--exclude-manual)
     src/rsc2_profile.c      # RSC2_PROFILE sampling profiler (Linux)
     src/rsc2_callcount.c    # RSC2_CALLCOUNT (needs tools/callcount_instrument.py on)

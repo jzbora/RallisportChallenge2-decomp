@@ -105,11 +105,12 @@ static void menu_input(void)
     sub_001DBF90();
 }
 
+extern recomp_func_t rsc2_menu_exit_lookup(uint32_t va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (xbox_va == 0x001DBF90u)
         return menu_input;
-    return (recomp_func_t)0;
+    return rsc2_menu_exit_lookup(xbox_va);
 }
 
 /* ── ICALL failure logging ─────────────────────────────────── */
