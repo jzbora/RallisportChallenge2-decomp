@@ -98,6 +98,11 @@ int main(void) {
     if(ok) ok=invoke(h,NULL,0,1) && g_eax==0x80000006u;
     if(ok) ok=invoke(h,"Save*",1,1) && g_eax==0;
     if(ok) ok=invoke(h,"*",1,1) && g_eax==0 && e->FileNameLength==8 && !memcmp(e->FileName,"SaveSlot",8);
+    /* RSC2 passes a valid ANSI_STRING with Length=0 for saved-game files. */
+    if(ok) ok=invoke(h,"",1,1) && g_eax==0 && e->FileNameLength==8 && !memcmp(e->FileName,"SaveSlot",8);
+    if(ok) ok=invoke(h,NULL,0,1) && g_eax==0x80000006u;
+    if(ok) ok=invoke(h,"Missing*",1,1) && g_eax==0x80000006u;
+    if(ok) ok=invoke(h,"*",1,1) && g_eax==0;
     if(ok) ok=invoke(h,"*",1,2) && g_eax==0xC0000003u;
     if(ok) ok=check_status_mapping(0x80000006u,18) && check_status_mapping(0,0)
         && check_status_mapping(0xC0000008u,6);

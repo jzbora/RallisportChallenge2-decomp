@@ -494,7 +494,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             if (info->DeleteFile) {
                 FILE_DISPOSITION_INFO_EX fdx;
                 fdx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
-                ok = SetFileInformationByHandle(use, FileDispositionInfoEx, &fdx, sizeof(fdx));
+                /* Win10 FileDispositionInfoEx is ABI value 21. MinGW 11
+                 * exposes the payload/flags but hides the enum member behind
+                 * an inconsistent _WIN32_WINNT guard. Preserve the operation
+                 * (and the older-OS fallback below) with its stable ABI value. */
+                ok = SetFileInformationByHandle(use, (FILE_INFO_BY_HANDLE_CLASS)21,
+                                                &fdx, sizeof(fdx));
             }
 #endif
             if (!ok) {
@@ -558,6 +563,70 @@ NTSTATUS xbox_RenameOpenFile(HANDLE FileHandle, const xbox_host_char *new_host_p
     memcpy(fri->FileName, new_host_path, (len + 1) * sizeof(WCHAR));
     if (!SetFileInformationByHandle(FileHandle, FileRenameInfo, fri, (DWORD)bytes)) {
         DWORD err = GetLastError();
+        /* RSC2 rebuilds name.cache on each boot, then promotes it to name.
+         * Opt in only for this title and only for the exact sibling staging
+         * filename: ordinary no-replace renames must still report collisions.
+         * Win32 can retain the previous cache name while a reader is open. */
+        const char *cache_replace = getenv("RECOMP_CACHE_REPLACE");
+        if ((err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS) &&
+            cache_replace && strcmp(cache_replace, "1") == 0) {
+            WCHAR source[MAX_PATH * 2], target[MAX_PATH * 2], staged[MAX_PATH * 2];
+            DWORD n = GetFinalPathNameByHandleW(FileHandle, source,
+                MAX_PATH * 2, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            HANDLE target_handle = CreateFileW(new_host_path, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+            DWORD m = target_handle == INVALID_HANDLE_VALUE ? 0 :
+                GetFinalPathNameByHandleW(target_handle, target, MAX_PATH * 2,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (target_handle != INVALID_HANDLE_VALUE) CloseHandle(target_handle);
+            if (n && n < MAX_PATH * 2 && m && m + 6 < MAX_PATH * 2) {
+                swprintf_s(staged, MAX_PATH * 2, L"%ls.cache", target);
+                BOOL sibling = _wcsicmp(source, staged) == 0;
+                /* Packaged desktop hosts may virtualize AppData. The staging
+                 * handle can have the logical path while the old target has
+                 * a LocalCache backing path. Verify the logical sibling too,
+                 * then rename to the target handle's actual backing path. */
+                if (!sibling) {
+                    WCHAR logical[MAX_PATH * 2];
+                    DWORD l = GetFullPathNameW(new_host_path, MAX_PATH * 2, logical, NULL);
+                    if (l && l + 10 < MAX_PATH * 2) {
+                        WCHAR expanded[MAX_PATH * 2];
+                        DWORD e = GetLongPathNameW(logical, expanded, MAX_PATH * 2);
+                        const WCHAR *p = e && e < MAX_PATH * 2 ? expanded : logical;
+                        swprintf_s(staged, MAX_PATH * 2, L"\\\\?\\%ls.cache", p);
+                        sibling = _wcsicmp(source, staged) == 0;
+                    }
+                }
+                if (sibling) {
+                    size_t resolved_bytes = sizeof(FILE_RENAME_INFO) + (m + 1) * sizeof(WCHAR);
+                    FILE_RENAME_INFO *resolved = (FILE_RENAME_INFO *)calloc(1, resolved_bytes);
+                    if (!resolved) { free(fri); return STATUS_NO_MEMORY; }
+                    free(fri);
+                    fri = resolved;
+                    bytes = resolved_bytes;
+                    fri->FileNameLength = m * sizeof(WCHAR);
+                    memcpy(fri->FileName, target, (m + 1) * sizeof(WCHAR));
+                    /* FileRenameInfoEx (22), REPLACE_IF_EXISTS | POSIX_SEMANTICS.
+                     * Existing readers keep the old object, as on the Xbox. */
+                    *(DWORD *)fri = 3;
+                    BOOL promoted = SetFileInformationByHandle(FileHandle,
+                        (FILE_INFO_BY_HANDLE_CLASS)22, fri, (DWORD)bytes);
+                    if (!promoted) {
+                        *(DWORD *)fri = 0;
+                        fri->ReplaceIfExists = TRUE;
+                        promoted = SetFileInformationByHandle(FileHandle,
+                            FileRenameInfo, fri, (DWORD)bytes);
+                    }
+                    if (promoted) {
+                        fprintf(stderr, "  [FILE] replaced previous cache from sibling .cache file\n");
+                        free(fri);
+                        return STATUS_SUCCESS;
+                    }
+                    err = GetLastError();
+                }
+            }
+        }
         fprintf(stderr, "  [FILE] rename via handle failed (error %lu)\n",
                 (unsigned long)err);
         st = err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS
@@ -741,7 +810,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        /* XDK callers use a non-NULL, zero-length ANSI_STRING to enumerate
+         * every file (including the files inside an existing saved game).
+         * An empty Win32 search path matches nothing; use the same wildcard
+         * as a NULL filter and as the POSIX backend. */
+        if (FileName && FileName->Buffer && FileName->Length > 0) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
