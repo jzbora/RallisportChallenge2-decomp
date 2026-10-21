@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #endif
 
 /* The renderer's GPU list (xboxrecomp nv2a_vk.c). */
@@ -275,6 +276,12 @@ static int opt_find(const Opt *o, const char *val)
 static void settings_dir(char *out, size_t n)
 {
 #ifdef _WIN32
+    DWORD portable_attr = GetFileAttributesW(L"portable-mode.txt");
+    if (portable_attr != INVALID_FILE_ATTRIBUTES &&
+        !(portable_attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        snprintf(out, n, "portable-data\\Settings");
+        return;
+    }
     const char *base = getenv("APPDATA");
     snprintf(out, n, "%s\\rsc2", base && *base ? base : ".");
 #else

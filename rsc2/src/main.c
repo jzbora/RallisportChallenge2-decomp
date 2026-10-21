@@ -466,6 +466,30 @@ static int s_argc;
 static char **s_argv;
 
 #ifdef _WIN32
+/* Opt-in per-install state. Resolve the marker beside the executable so a
+ * shortcut's working directory cannot mix two installations' data. */
+static int s_portable_mode;
+static void rsc2_portable_init(void)
+{
+    WCHAR folder[MAX_PATH], marker[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, folder, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    WCHAR *last = wcsrchr(folder, L'\\');
+    if (!last) return;
+    *last = 0;
+    if (wcslen(folder) + 20 >= MAX_PATH) return;
+    swprintf_s(marker, MAX_PATH, L"%ls\\portable-mode.txt", folder);
+    DWORD attr = GetFileAttributesW(marker);
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY) &&
+        SetCurrentDirectoryW(folder)) {
+        s_portable_mode = 1;
+        CreateDirectoryW(L"portable-data", NULL);
+        CreateDirectoryW(L"portable-data\\Settings", NULL);
+    }
+}
+#endif
+
+#ifdef _WIN32
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 #else
@@ -480,6 +504,10 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+#ifdef _WIN32
+    rsc2_portable_init();
+#endif
 
     /* The launcher (launcher.c): saved settings into the environment, after
      * a settings window unless it is turned off. Runs before the defaults
@@ -538,6 +566,7 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
             { "RECOMP_HEAP_RECLAIM",  "1" },
             { "RECOMP_CONTIG_TOPDOWN", "1" },
             { "RECOMP_PHYS_TAG",      "1" },  /* heap phys != window phys */
+            { "RECOMP_CACHE_REPLACE", "1" },  /* promote rebuilt sibling .cache files on Windows */
             { "RECOMP_FB_WINDOW",     "1" },  /* show the game in a window */
             { "RECOMP_KEYBOARD",      "1" },  /* keyboard as pad 0 */
             { "RECOMP_USB",           "1" },  /* emulated OHCI + pad */
@@ -652,7 +681,11 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
+#ifdef _WIN32
+        xbox_path_init(YOUR_GAME_DIR, s_portable_mode ? "portable-data" : NULL);
+#else
         xbox_path_init(YOUR_GAME_DIR, NULL);
+#endif
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
