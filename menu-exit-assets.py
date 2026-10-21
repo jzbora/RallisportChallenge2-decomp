@@ -132,10 +132,22 @@ def locale(b,chinese,parser=None):
     return result
 
 if __name__=='__main__':
-    out=Path('menu-exit-output');out.mkdir(exist_ok=True)
-    result,changes=patch_archive(Path('RalliSport2/Layer0/MenuHDD.fa').read_bytes())
+    import argparse
+    parser=argparse.ArgumentParser(description='Generate native quit-menu assets locally')
+    parser.add_argument('--source',type=Path,default=Path('RalliSport2'))
+    parser.add_argument('--output',type=Path,default=Path('menu-exit-output'))
+    args=parser.parse_args()
+    out=args.output.resolve();source=args.source.resolve()
+    if out==source or source in out.parents or out in source.parents: parser.error('Use separate source and output directories')
+    if out.exists() and any(out.iterdir()): parser.error('Use a fresh output directory')
+    out.mkdir(parents=True,exist_ok=True)
+    result,changes=patch_archive((source/'Layer0/MenuHDD.fa').read_bytes())
     print(changes)
     assert len(changes)==2,changes
     (out/'MenuHDD.fa').write_bytes(result)
-    for label,source in [('english','RalliSport2'),('chinese','rsc2-zh-pilot/game')]:
-        (out/(label+'-localestrings.str')).write_bytes(locale((Path(source)/'Locale/English/localestrings.str').read_bytes(),label=='chinese'))
+    spec=importlib.util.spec_from_file_location('zh',Path(__file__).with_name('chinese-pilot.py'))
+    zh=importlib.util.module_from_spec(spec);spec.loader.exec_module(zh)
+    original=(source/'Locale/English/localestrings.str').read_bytes()
+    for label in ('english','chinese'):
+        text=zh.translate_locale(original) if label=='chinese' else original
+        (out/(label+'-localestrings.str')).write_bytes(locale(text,label=='chinese',zh.parse_locale))

@@ -29,3 +29,28 @@ gdb*.txt
 # Claude Code local state (the project skill in .claude/skills is tracked)
 .claude/*
 !.claude/skills/
+
+# Local installations, private state and generated localization assets
+/.venv-linux/
+/logs/
+/font-probe/
+/rsc2-zh-pilot/
+/menu-exit-output/
+/local-output/
+/*backup*/
+/*-update/
+/*-pilot/
+*.fa
+*.str
+*.bik
+*.profile
+*.exe
+*.dll
+*.o
+*.zip
+portable-mode.txt
+portable-data/
+UDATA/
+TDATA/
+.env
+.env.*

@@ -4,8 +4,14 @@ import json, re, runpy, struct
 from PIL import Image
 
 root = Path(__file__).resolve().parent
+import argparse
+parser=argparse.ArgumentParser()
+parser.add_argument('--source',type=Path,default=root/'RalliSport2')
+parser.add_argument('--game',type=Path,default=root/'rsc2-zh-pilot/game')
+args=parser.parse_args()
 mod = runpy.run_path(str(root/'chinese-pilot.py'))
-source, output = root/'RalliSport2', root/'rsc2-zh-pilot/game'
+source, output = args.source.resolve(), args.game.resolve()
+(root/'logs').mkdir(exist_ok=True)
 translations = mod['TRANSLATIONS']
 _, original_text, names, _ = mod['parse_locale']((source/'Locale/English/localestrings.str').read_bytes())
 _, translated_text, new_names, _ = mod['parse_locale']((output/'Locale/English/localestrings.str').read_bytes())

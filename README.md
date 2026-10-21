@@ -1,5 +1,10 @@
 # RalliSport Challenge 2 — static recompilation
 
+This fork's `dev` branch maintains Windows fixes, portable per-install state,
+native controller-operated Quit menus, and Simplified Chinese menu tools.
+See [维护与汉化构建说明 / Maintenance](MAINTENANCE.md).
+`main` follows upstream. Game data and generated localization assets are not included.
+
 A native PC build of *RalliSport Challenge 2* (Xbox, NTSC, title `0x4D530039`),
 made by statically recompiling the original executable with the
 [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit. Linux first;

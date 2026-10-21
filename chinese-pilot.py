@@ -6,6 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent
 ORIGINAL = ROOT / 'RalliSport2'
 OUTPUT = ROOT / 'rsc2-zh-pilot'
+FONT_PATH = ROOT / 'third_party/fonts/NotoSansCJKsc-Bold.otf'
 TRANSLATIONS = {
     'LID_HEAD_MAIN': '主菜单',
     'LID_HEAD_OPTIONS': '设置',
@@ -125,7 +126,7 @@ def patch_resource(b, name):
             assert width <= 4096 and new_height <= 4096
             expanded = Image.new('L', (width, new_height))
             expanded.paste(atlas, (0, 0))
-            font = ImageFont.truetype(r'C:\Windows\Fonts\msyhbd.ttc', size * 4)
+            font = ImageFont.truetype(str(FONT_PATH), size * 4)
             for j, ch in enumerate(added):
                 bb = font.getbbox(ch)
                 # Keep punctuation on a normal em square. Cropping each
@@ -212,25 +213,43 @@ def repack_fonts(original):
     return bytes(result), changed
 
 def main():
-    OUTPUT.mkdir(exist_ok=True)
+    import argparse
+    global ORIGINAL, OUTPUT, FONT_PATH
+    parser = argparse.ArgumentParser(description='Generate local menu assets from your own game files.')
+    parser.add_argument('--source', type=Path, default=ORIGINAL)
+    parser.add_argument('--output', type=Path, default=OUTPUT)
+    parser.add_argument('--font', type=Path, default=FONT_PATH, help='Licensed CJK font; see MAINTENANCE.md')
+    parser.add_argument('--font-license', type=Path, default=ROOT/'licenses/NotoCJK-OFL.txt')
+    parser.add_argument('--exe', type=Path, help='Optional compiled runtime to copy')
+    parser.add_argument('--copy-assets', action='store_true', help='Copy unchanged game files for a local test installation')
+    args = parser.parse_args()
+    ORIGINAL, OUTPUT, FONT_PATH = args.source.resolve(), args.output.resolve(), args.font.resolve()
+    if ORIGINAL == OUTPUT or ORIGINAL in OUTPUT.parents or OUTPUT in ORIGINAL.parents:
+        parser.error('Source and output must be separate, non-nested directories')
+    if not FONT_PATH.is_file(): parser.error('CJK font missing; download the OFL font described in MAINTENANCE.md or pass --font')
+    if not args.font_license.is_file(): parser.error('Font license missing; pass --font-license')
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    (ROOT / 'font-probe').mkdir(exist_ok=True)
+    (OUTPUT/'licenses').mkdir(exist_ok=True)
+    shutil.copy2(args.font_license, OUTPUT/'licenses/CJK-FONT-LICENSE.txt')
     (OUTPUT / 'portable-mode.txt').write_text('Per-install cache and settings.\n', encoding='ascii')
     settings = OUTPUT / 'portable-data' / 'Settings'
     settings.mkdir(parents=True, exist_ok=True)
-    english_settings = Path(r'D:\Games\RalliSport Challenge 2\英文版\portable-data\Settings\settings.ini')
-    if not (settings / 'settings.ini').exists() and english_settings.exists():
-        shutil.copy2(english_settings, settings / 'settings.ini')
     game = OUTPUT / 'game'
     game.mkdir(exist_ok=True)
     locale = Path('Locale/English/localestrings.str')
     fonts = Path('Layer0/FontsEnglish.fa')
-    for src in ORIGINAL.rglob('*'):
-        rel = src.relative_to(ORIGINAL)
-        dst = game / rel
-        if src.is_dir(): dst.mkdir(parents=True, exist_ok=True)
-        elif rel not in (locale, fonts) and not dst.exists():
-            os.link(src, dst)  # unchanged disc assets, same C: volume
-    for name in ('rsc2.exe',):
-        shutil.copy2(Path(r'D:\Games\RalliSport Challenge 2\英文版') / name, OUTPUT / name)
+    if args.copy_assets:
+        for src in ORIGINAL.rglob('*'):
+            rel = src.relative_to(ORIGINAL)
+            if rel.parts[0].upper() in ('UDATA', 'TDATA'): continue
+            dst = game / rel
+            if src.is_dir(): dst.mkdir(parents=True, exist_ok=True)
+            elif rel not in (locale, fonts) and not dst.exists(): shutil.copy2(src, dst)
+    for rel in (locale, fonts):
+        (game / rel).parent.mkdir(parents=True, exist_ok=True)
+        if (game / rel).exists(): parser.error('Output already contains generated assets; use a fresh output directory')
+    if args.exe: shutil.copy2(args.exe, OUTPUT / 'rsc2.exe')
     translated = translate_locale((ORIGINAL / locale).read_bytes())
     exit_assets = ROOT / 'menu-exit-assets.py'
     if exit_assets.exists():
@@ -241,13 +260,14 @@ def main():
         # Replace the path atomically: unchanged pilot assets can be hardlinks
         # to the original disc and must never be overwritten in place.
         menu_path = game / 'Layer0/MenuHDD.fa'
+        menu_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = menu_path.with_suffix('.new')
         temporary.write_bytes(menu_archive)
         os.replace(temporary, menu_path)
     (game / locale).write_bytes(translated)
     packed, changed = repack_fonts((ORIGINAL / fonts).read_bytes())
     (game / fonts).write_bytes(packed)
-    report = dict(translations=TRANSLATIONS, font_mode='unicode', unicode_glyphs={c:hex(v) for c,v in ENCODING.items()},
+    report = dict(translations=TRANSLATIONS, font_mode='unicode', font_file=FONT_PATH.name, unicode_glyphs={c:hex(v) for c,v in ENCODING.items()},
                   patched_fonts=changed, output=str(OUTPUT), font_bytes=len(packed))
     (OUTPUT / 'pilot-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2), encoding='utf-8')
     print(json.dumps(report,ensure_ascii=False,indent=2))

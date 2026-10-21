@@ -1,8 +1,14 @@
 import runpy,struct,json
 from pathlib import Path
-m=runpy.run_path('menu-exit-assets.py')
-stock=Path('RalliSport2/Layer0/MenuHDD.fa').read_bytes()
-patched=Path('menu-exit-output/MenuHDD.fa').read_bytes()
+import argparse
+root=Path(__file__).resolve().parent
+parser=argparse.ArgumentParser()
+parser.add_argument('--source',type=Path,default=root/'RalliSport2')
+parser.add_argument('--output',type=Path,default=root/'menu-exit-output')
+args=parser.parse_args()
+m=runpy.run_path(str(root/'menu-exit-assets.py'))
+stock=(args.source/'Layer0/MenuHDD.fa').read_bytes()
+patched=(args.output/'MenuHDD.fa').read_bytes()
 old,files,table,n,blocks=m['archive_read'](stock)
 new,nfiles,ntable,nn,nblocks=m['archive_read'](patched)
 assert n==nn and files==nfiles
@@ -29,14 +35,16 @@ for i in range(n):
         assert target[1] not in {key for text,key in choices}
         changes.append({'screen':name,'original_choices':len(choices),'new_choices':len(choices)+1})
 assert len(changes)==2
-zh=runpy.run_path('chinese-pilot.py')
-for label,path in [('english','RalliSport2'),('chinese','menu-exit-backup-2026-10-20')]:
-    original=Path(path)/('Locale/English/localestrings.str' if label=='english' else 'localestrings.str')
-    a=zh['parse_locale'](original.read_bytes())[1]
-    b=zh['parse_locale'](Path('menu-exit-output',label+'-localestrings.str').read_bytes())[1]
+zh=runpy.run_path(str(root/'chinese-pilot.py'))
+original=(args.source/'Locale/English/localestrings.str').read_bytes()
+for label in ('english','chinese'):
+    expected=zh['translate_locale'](original) if label=='chinese' else original
+    a=zh['parse_locale'](expected)[1]
+    b=zh['parse_locale']((args.output/(label+'-localestrings.str')).read_bytes())[1]
     assert all(b[k]==v for k,v in a.items())
     assert b.keys()-a.keys()=={0xF000,0xF001}
     if label=='chinese':assert not (set(b[0xF000]+b[0xF001])-set(zh['CHARS'])-set('\r\n'))
 report={'screens':changes,'other_resources_preserved':unchanged,'existing_locale_strings_preserved':True}
-Path('logs/menu-exit-assets-validation.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+(root/'logs').mkdir(exist_ok=True)
+(root/'logs/menu-exit-assets-validation.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
 print(json.dumps(report,ensure_ascii=False,indent=2))
